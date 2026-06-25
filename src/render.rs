@@ -138,7 +138,7 @@ impl MarkdownRenderer {
             entries.push((title, icon, encode_path(&format!("{name}/index.md"))));
         }
 
-        entries.sort_by(|a, b| a.0.to_lowercase().cmp(&b.0.to_lowercase()));
+        entries.sort_by_key(|a| a.0.to_lowercase());
         let mut lines = vec![
             "# Notion backup".to_string(),
             String::new(),
