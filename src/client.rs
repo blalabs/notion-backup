@@ -75,8 +75,15 @@ impl NotionClient {
         api_version: impl Into<String>,
         base_url: &str,
     ) -> Self {
+        // Surface non-2xx responses as Ok so the retry logic can read their
+        // status and the `Retry-After` header itself, rather than ureq mapping
+        // them to an opaque error.
+        let agent: ureq::Agent = ureq::Agent::config_builder()
+            .http_status_as_error(false)
+            .build()
+            .into();
         NotionClient {
-            agent: ureq::AgentBuilder::new().build(),
+            agent,
             base_url: base_url.trim_end_matches('/').to_string(),
             token: token.into(),
             api_version: api_version.into(),
@@ -92,51 +99,66 @@ impl NotionClient {
         body: Option<&Value>,
     ) -> Result<Value, ClientError> {
         let url = format!("{}{}", self.base_url, path);
+        let bearer = format!("Bearer {}", self.token);
         for attempt in 1..=MAX_RETRIES {
             thread::sleep(REQUEST_INTERVAL);
 
-            let req = self
-                .agent
-                .request(method, &url)
-                .set("Authorization", &format!("Bearer {}", self.token))
-                .set("Notion-Version", &self.api_version)
-                .set("Content-Type", "application/json");
-
             let result = match body {
-                Some(payload) => req.send_json(payload),
-                None => req.call(),
+                Some(payload) => self
+                    .agent
+                    .post(&url)
+                    .header("Authorization", &bearer)
+                    .header("Notion-Version", &self.api_version)
+                    .header("Content-Type", "application/json")
+                    .send_json(payload),
+                None => self
+                    .agent
+                    .get(&url)
+                    .header("Authorization", &bearer)
+                    .header("Notion-Version", &self.api_version)
+                    .header("Content-Type", "application/json")
+                    .call(),
             };
 
-            match result {
-                Ok(response) => {
-                    return response
-                        .into_json::<Value>()
-                        .map_err(|e| ClientError::Other(format!("invalid JSON body: {e}")));
-                }
-                Err(ureq::Error::Status(429, response)) => {
-                    let retry_after = response
-                        .header("Retry-After")
-                        .and_then(|v| v.parse::<f64>().ok())
-                        .unwrap_or(DEFAULT_RETRY_AFTER);
-                    warn!(
-                        "Rate limited on {method} {path} (attempt {attempt}/{MAX_RETRIES}); \
-                         sleeping {retry_after:.1}s"
-                    );
-                    thread::sleep(Duration::from_secs_f64(retry_after));
-                }
-                Err(ureq::Error::Status(code, _)) if code >= 500 => {
-                    let backoff = (1u64 << attempt).min(30);
-                    warn!(
-                        "Server error {code} on {method} {path} (attempt {attempt}/{MAX_RETRIES}); \
-                         retrying in {backoff}s"
-                    );
-                    thread::sleep(Duration::from_secs(backoff));
-                }
-                Err(ureq::Error::Status(code, _)) => return Err(ClientError::Http(code)),
-                Err(ureq::Error::Transport(t)) => {
-                    return Err(ClientError::Other(format!("transport error: {t}")))
-                }
+            let mut response = match result {
+                Ok(response) => response,
+                Err(err) => return Err(ClientError::Other(format!("transport error: {err}"))),
+            };
+            let status = response.status().as_u16();
+
+            if status == 429 {
+                let retry_after = response
+                    .headers()
+                    .get("Retry-After")
+                    .and_then(|v| v.to_str().ok())
+                    .and_then(|v| v.parse::<f64>().ok())
+                    .unwrap_or(DEFAULT_RETRY_AFTER);
+                warn!(
+                    "Rate limited on {method} {path} (attempt {attempt}/{MAX_RETRIES}); \
+                     sleeping {retry_after:.1}s"
+                );
+                thread::sleep(Duration::from_secs_f64(retry_after));
+                continue;
             }
+
+            if status >= 500 {
+                let backoff = (1u64 << attempt).min(30);
+                warn!(
+                    "Server error {status} on {method} {path} (attempt {attempt}/{MAX_RETRIES}); \
+                     retrying in {backoff}s"
+                );
+                thread::sleep(Duration::from_secs(backoff));
+                continue;
+            }
+
+            if status >= 400 {
+                return Err(ClientError::Http(status));
+            }
+
+            return response
+                .body_mut()
+                .read_json::<Value>()
+                .map_err(|e| ClientError::Other(format!("invalid JSON body: {e}")));
         }
         Err(ClientError::Other(format!(
             "Exhausted retries for {method} {path}"
