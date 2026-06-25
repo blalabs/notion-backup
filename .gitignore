@@ -1,0 +1,11 @@
+# Secrets and local config
+.env
+
+# Rust
+/target/
+
+# macOS
+.DS_Store
+
+# Adjust if you keep the source and backup separate.
+# /backup/
